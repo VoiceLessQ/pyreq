@@ -1,126 +1,100 @@
-# packaging
+# pyreq
 
-A Rust implementation of [PEP 440](https://peps.python.org/pep-0440/) version identifiers:
-parsing, comparison, and normalization. It mirrors the behaviour of Python's
-[`packaging`](https://github.com/pypa/packaging) library — the same strings parse the same
-way, normalize to the same canonical form, and sort in the same order.
+A Rust port of Python [`packaging`](https://github.com/pypa/packaging)'s
+[PEP 440](https://peps.python.org/pep-0440/) versions and
+[PEP 508](https://peps.python.org/pep-0508/) dependency specifiers. Version parsing and
+ordering, version specifiers, environment markers, and requirements all mirror the reference
+implementation — verified by differential testing against Python across millions of cases.
 
 ## Features
 
-- Parse version strings into structured form, with full PEP 440 normalization (spelling
-  aliases such as `alpha`→`a` and `c`→`rc`, implicit pre/post numbers, the `1.0-1` post
-  form, and local-label separators).
-- Total ordering that follows PEP 440: `1.0.dev1 < 1.0a1 < 1.0rc1 < 1.0 < 1.0.post1`,
-  including epochs and correctly ordered local labels.
-- Equality and hashing that ignore insignificant differences (`1.0 == 1.0.0`).
-- Canonical string output via `Display`.
-- Read every component (epoch, release, pre, post, dev, local) plus helpers like `major`,
-  `minor`, `micro`, `is_prerelease`, and `base_version`.
-- Build versions directly from their parts, without going through a string.
+- **Versions** (`Version`) — PEP 440 parsing with full normalization, total ordering
+  (`1.0.dev1 < 1.0a1 < 1.0rc1 < 1.0 < 1.0.post1`), equality/hashing that ignore insignificant
+  differences (`1.0 == 1.0.0`), canonical `Display`, component accessors, and `from_parts`.
+- **Specifiers** (`Specifier`, `SpecifierSet`) — `~= == != <= >= < > ===`, wildcards
+  (`==1.0.*`), comma-joined sets, `contains`, `filter`, and the PEP 440 pre-release rules.
+- **Markers** (`Marker`) — PEP 508 environment markers: parse, canonical `Display`, and
+  evaluation against an environment.
+- **Requirements** (`Requirement`) — full dependency specifiers such as
+  `requests[security]>=2.0; python_version<"3.9"`.
 
 ## Installation
 
 ```sh
-cargo add packaging
+cargo add pyreq
 ```
 
 Or add it to `Cargo.toml`:
 
 ```toml
 [dependencies]
-packaging = "0.1"
+pyreq = "0.1"
 ```
 
 Requires a Rust toolchain with 2024-edition support (Rust 1.85 or newer).
 
 ## Usage
 
-### Parse and inspect
+### Versions
 
 ```rust
-use packaging::Version;
+use pyreq::Version;
 
 let v: Version = "1!2.3.4rc1.post2".parse().unwrap();
-
-assert_eq!(v.epoch(), 1);
 assert_eq!(v.release(), &[2, 3, 4]);
-assert_eq!(v.major(), 2);
-assert_eq!(v.base_version(), "1!2.3.4");
 assert!(v.is_prerelease());
+
+// Ordering and equality follow PEP 440.
+assert!("1.0rc1".parse::<Version>().unwrap() < "1.0".parse().unwrap());
+assert_eq!("1.0".parse::<Version>().unwrap(), "1.0.0".parse().unwrap());
 ```
 
-### Compare and sort
+### Specifiers
 
 ```rust
-use packaging::Version;
+use pyreq::SpecifierSet;
 
-let mut versions: Vec<Version> = ["1.0", "1.0.post1", "1.0rc1", "1.0.dev1"]
-    .iter()
-    .map(|s| s.parse().unwrap())
-    .collect();
-
-versions.sort();
-
-let sorted: Vec<String> = versions.iter().map(|v| v.to_string()).collect();
-assert_eq!(sorted, ["1.0.dev1", "1.0rc1", "1.0", "1.0.post1"]);
+let specs: SpecifierSet = ">=1.0,<2.0".parse().unwrap();
+assert!(specs.contains("1.5", None));
+assert!(!specs.contains("2.0", None));
 ```
 
-### Equality ignores insignificant differences
+### Requirements
 
 ```rust
-use packaging::Version;
+use pyreq::Requirement;
 
-let a: Version = "1.0".parse().unwrap();
-let b: Version = "1.0.0".parse().unwrap();
-assert_eq!(a, b);
+let req = Requirement::parse("requests[security]>=2.0; python_version<\"3.9\"").unwrap();
+assert_eq!(req.name, "requests");
+assert!(req.marker.is_some());
 ```
 
-### Normalization
+### Markers
 
 ```rust
-use packaging::Version;
+use std::collections::HashMap;
+use pyreq::Marker;
 
-// Leading `v`, surrounding whitespace, and alternate spellings all normalize.
-let v: Version = "  v1.0ALPHA1  ".parse().unwrap();
-assert_eq!(v.to_string(), "1.0a1");
-```
-
-### Build from parts
-
-```rust
-use packaging::{PreLetter, Version, VersionParts};
-
-let v = Version::from_parts(VersionParts {
-    release: vec![1, 2, 3],
-    pre: Some((PreLetter::Rc, 1)),
-    ..Default::default()
-})
-.unwrap();
-
-assert_eq!(v.to_string(), "1.2.3rc1");
-```
-
-### Invalid input
-
-```rust
-use packaging::Version;
-
-assert!("not.a.version".parse::<Version>().is_err());
+let marker = Marker::parse("python_version >= \"3.8\"").unwrap();
+let env = HashMap::from([("python_version".to_string(), "3.11".to_string())]);
+assert_eq!(marker.evaluate(&env), Ok(true));
 ```
 
 ## Compatibility
 
-Behaviour is differentially tested against the reference Python `packaging` implementation
-across a large generated corpus of version strings: validity, normalized output, and total
-sort order all match.
+Every layer is differentially tested against the reference Python `packaging` implementation:
+60k+ version strings (validity, normalized output, total ordering), thousands of specifier and
+requirement checks, and marker evaluations — all matching.
 
-Version components are stored as 64-bit integers, so version numbers beyond `2^64 − 1` are
-not supported (these do not occur in practice).
+Notes: version components are stored as 64-bit integers, so values beyond `2^64 − 1` are
+unsupported (they do not occur in practice). `Marker::evaluate` takes an explicit environment
+rather than synthesizing a platform default.
 
 ## Scope
 
-This crate currently covers PEP 440 **version identifiers**. Version specifiers
-(`>=1.0,<2.0`) and requirement/marker parsing are not yet implemented.
+Covers PEP 440 versions and PEP 508 dependency specifiers — versions, specifiers, markers, and
+requirements. Platform/format helpers from `packaging` (wheel tags, metadata, manylinux, etc.)
+are out of scope.
 
 ## License
 

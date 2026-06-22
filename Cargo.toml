@@ -1,12 +1,12 @@
 [package]
-name = "packaging"
+name = "pyreq"
 version = "0.1.0"
 edition = "2024"
-description = "PEP 440 version identifiers: parsing, comparison, and normalization, compatible with Python's packaging."
+description = "A Rust port of Python packaging: PEP 440 versions and PEP 508 specifiers, markers, and requirements."
 license = "BSD-2-Clause"
 repository = "https://github.com/VoiceLessQ/packaging-rs"
 readme = "README.md"
-keywords = ["pep440", "version", "versioning", "packaging", "python"]
+keywords = ["pep440", "pep508", "version", "packaging", "python"]
 categories = ["parser-implementations"]
 
 [dependencies]
