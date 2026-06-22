@@ -368,9 +368,13 @@ fn eval_op(lhs: &str, op: &str, rhs: &str, key: &str) -> Result<bool, MarkerErro
     match op {
         "in" => Ok(rhs.contains(lhs)),
         "not in" => Ok(!rhs.contains(lhs)),
-        "<" | ">" => Ok(false),
-        "<=" | "==" | ">=" => Ok(lhs == rhs),
+        // Non-version keys use Python's string operators (lexicographic), per `_operators`.
+        "<" => Ok(lhs < rhs),
+        "<=" => Ok(lhs <= rhs),
+        "==" => Ok(lhs == rhs),
         "!=" => Ok(lhs != rhs),
+        ">=" => Ok(lhs >= rhs),
+        ">" => Ok(lhs > rhs),
         _ => Err(MarkerError::UndefinedComparison(format!(
             "Undefined {op:?} on {lhs:?} and {rhs:?}."
         ))),
@@ -523,9 +527,12 @@ mod tests {
         assert!(m("os_name != \"nt\"").evaluate(&e).unwrap());
         assert!(m("\"x86\" in platform_machine").evaluate(&e).unwrap());
         assert!(m("platform_machine not in \"arm64\"").evaluate(&e).unwrap());
-        // Degenerate string operators: `<`/`>` are always false; `>=` is equality.
-        assert!(!m("os_name < \"z\"").evaluate(&e).unwrap());
+        // String keys compare lexicographically (Python's str operators), not equality-only.
+        assert!(m("os_name < \"z\"").evaluate(&e).unwrap()); // "posix" < "z"
+        assert!(!m("os_name < \"a\"").evaluate(&e).unwrap());
+        assert!(m("os_name <= \"z\"").evaluate(&e).unwrap()); // <= is a real compare, not ==
         assert!(m("os_name >= \"posix\"").evaluate(&e).unwrap());
+        assert!(!m("os_name > \"z\"").evaluate(&e).unwrap());
     }
 
     #[test]
