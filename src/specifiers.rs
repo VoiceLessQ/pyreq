@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::{Version, VersionParts};
+use crate::Version;
 
 /// Raised when a specifier string is not valid. Holds the offending string.
 ///
@@ -183,18 +183,21 @@ impl Specifier {
     /// raises (computing `self.prereleases` parses the arbitrary string and fails). A
     /// `bool`-returning API cannot reproduce that, and returning `false` is the safer behaviour.
     pub fn contains(&self, item: &str, prereleases: Option<bool>) -> bool {
-        // `===` matches the raw string case-insensitively; a parse would be wasted.
+        // `===` coerces the item to a Version, then compares its normalized string to the raw
+        // spec version case-insensitively (so `===0` matches `0!0`, and `===1.0` rejects
+        // `1.0.0`). An unparsable item never matches.
         if self.operator == "===" {
-            if item.to_lowercase() != self.version.to_lowercase() {
-                return false;
-            }
+            let item_v = match coerce_version(item) {
+                Some(v) => v,
+                None => return false,
+            };
             // packaging's `contains` gates on `self.prereleases` (the property) directly, which
             // defaults to false; only an explicit `prereleases=` argument overrides it.
             let effective = prereleases.or_else(|| self.prereleases());
-            if effective == Some(false) && coerce_version(item).is_some_and(|v| v.is_prerelease()) {
+            if effective == Some(false) && item_v.is_prerelease() {
                 return false;
             }
-            return true;
+            return item_v.to_string().to_lowercase() == self.version.to_lowercase();
         }
 
         let parsed = match coerce_version(item) {
@@ -281,15 +284,63 @@ fn base_version_eq(a: &Version, b: &Version) -> bool {
     parse_spec(&a.base_version()) == parse_spec(&b.base_version())
 }
 
-/// Construct `epoch!release.dev0`, the smallest version with that epoch+release.
-fn dev0(epoch: u64, release: Vec<u64>) -> Version {
-    Version::from_parts(VersionParts {
-        epoch,
-        release,
-        dev: Some(0),
-        ..Default::default()
-    })
-    .expect("a .dev0 boundary is always a valid version")
+/// `^([0-9]+)((?:a|b|c|rc)[0-9]+)$`: splits a release/pre run like `0rc1` into `0`, `rc1`.
+/// Mirrors `specifiers.py`'s `_prefix_regex`.
+static PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?-u)\A([0-9]+)((?:a|b|c|rc)[0-9]+)\z").expect("prefix regex"));
+
+/// Split a version *string* into comparison components. Direct port of `_version_split`: works
+/// on the raw text (not a parsed `Version`), so quirks like a leading `v` survive into the
+/// components, matching packaging exactly.
+fn version_split(version: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let (epoch, rest) = match version.rsplit_once('!') {
+        Some((e, r)) => (e, r),
+        None => ("", version),
+    };
+    result.push(if epoch.is_empty() {
+        "0".to_string()
+    } else {
+        epoch.to_string()
+    });
+    for item in rest.split('.') {
+        if let Some(caps) = PREFIX_RE.captures(item) {
+            result.push(caps[1].to_string());
+            result.push(caps[2].to_string());
+        } else {
+            result.push(item.to_string());
+        }
+    }
+    result
+}
+
+/// Re-join split components as `epoch!rest`. Port of `_version_join`.
+fn version_join(components: &[String]) -> String {
+    let (epoch, rest) = components.split_first().expect("components include the epoch");
+    format!("{epoch}!{}", rest.join("."))
+}
+
+/// Whether `segment` is not a pre/post/dev suffix marker. Port of `_is_not_suffix`.
+fn is_not_suffix(segment: &str) -> bool {
+    !["dev", "a", "b", "rc", "post"]
+        .iter()
+        .any(|p| segment.starts_with(p))
+}
+
+/// 0-pad the release segments of two split versions to equal length. Port of `_pad_version`.
+fn pad_version(left: &[String], right: &[String]) -> (Vec<String>, Vec<String>) {
+    let is_digit = |x: &&String| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    let l_rel: Vec<String> = left.iter().take_while(is_digit).cloned().collect();
+    let r_rel: Vec<String> = right.iter().take_while(is_digit).cloned().collect();
+    let l_rest = &left[l_rel.len()..];
+    let r_rest = &right[r_rel.len()..];
+    let mut l = l_rel.clone();
+    l.extend(vec!["0".to_string(); r_rel.len().saturating_sub(l_rel.len())]);
+    l.extend_from_slice(l_rest);
+    let mut r = r_rel.clone();
+    r.extend(vec!["0".to_string(); l_rel.len().saturating_sub(r_rel.len())]);
+    r.extend_from_slice(r_rest);
+    (l, r)
 }
 
 /// Dispatch a standard (non-`===`) operator. The version string is a valid PEP 440
@@ -312,27 +363,32 @@ fn parse_spec(version: &str) -> Version {
     Version::parse(version).expect("specifier version is a valid PEP 440 version")
 }
 
-/// `~=V`: `>=V` and below the next release of `V`'s prefix (`V` with its last release
-/// component dropped, then incremented). `~=` requires at least two release components.
+/// `~=V`. Direct port of `_compare_compatible`: equivalent to `>=V` and `==prefix.*`, where the
+/// prefix is `V`'s components (sans suffixes) with the last one dropped, built from the raw
+/// spec string.
 fn compare_compatible(parsed: &Version, version: &str) -> bool {
-    let spec = parse_spec(version);
-    let mut prefix = spec.release().to_vec();
-    prefix.pop(); // drop last component; grammar guarantees >= 2 remained
-    *prefix.last_mut().expect("compatible prefix is non-empty") += 1;
-    let upper = dev0(spec.epoch(), prefix);
-    *parsed >= spec && *parsed < upper
+    let kept: Vec<String> = version_split(version)
+        .into_iter()
+        .take_while(|s| is_not_suffix(s))
+        .collect();
+    let prefix_parts = &kept[..kept.len().saturating_sub(1)];
+    let mut prefix = version_join(prefix_parts);
+    prefix.push_str(".*");
+    public_of(parsed) >= parse_spec(version) && compare_equal(parsed, &prefix)
 }
 
-/// `==V` or `==V.*`. Wildcard means the half-open prefix range `[V.dev0, next-prefix.dev0)`;
-/// otherwise exact equality, comparing public versions unless the spec carries a local.
+/// `==V` or `==V.*`. Direct port of `_compare_equal`: wildcard does prefix matching over the
+/// 0-padded, normalized component lists; otherwise exact equality, comparing public versions
+/// unless the spec carries a local label.
 fn compare_equal(parsed: &Version, version: &str) -> bool {
     if let Some(base) = version.strip_suffix(".*") {
-        let spec = parse_spec(base);
-        let lower = dev0(spec.epoch(), spec.release().to_vec());
-        let mut upper_release = spec.release().to_vec();
-        *upper_release.last_mut().expect("release is non-empty") += 1;
-        let upper = dev0(spec.epoch(), upper_release);
-        *parsed >= lower && *parsed < upper
+        let normalized_prospective = crate::canonicalize_version(&parsed.public(), false);
+        let normalized_spec = crate::canonicalize_version(base, false);
+        let split_spec = version_split(&normalized_spec);
+        let split_prospective = version_split(&normalized_prospective);
+        let (padded_prospective, _) = pad_version(&split_prospective, &split_spec);
+        let shortened: Vec<String> = padded_prospective.into_iter().take(split_spec.len()).collect();
+        shortened == split_spec
     } else {
         let spec = parse_spec(version);
         if spec.local().is_none() {
@@ -727,10 +783,15 @@ mod tests {
 
     #[test]
     fn arbitrary_equality() {
-        let spec = s("===foobar");
-        assert!(spec.contains("foobar", None));
-        assert!(spec.contains("FOOBAR", None)); // case-insensitive
-        assert!(!spec.contains("foobaz", None));
+        // `===V` compares the normalized item against the raw spec string.
+        let spec = s("===1.0");
+        assert!(spec.contains("1.0", None));
+        assert!(spec.contains("v1.0", None)); // normalizes to "1.0"
+        assert!(!spec.contains("1.0.0", None)); // normalizes to "1.0.0", not "1.0"
+        assert!(!spec.contains("2.0", None));
+        assert!(s("===0").contains("0!0", None)); // "0!0" normalizes to "0"
+        // A non-PEP 440 spec/item raises in packaging; here it simply never matches (no panic).
+        assert!(!s("===foobar").contains("foobar", None));
     }
 
     #[test]
