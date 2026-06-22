@@ -10,6 +10,17 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+mod specifiers;
+pub use specifiers::{InvalidSpecifier, Specifier, SpecifierSet};
+
+mod tokenizer;
+
+mod markers;
+pub use markers::{InvalidMarker, Marker, MarkerError};
+
+mod requirements;
+pub use requirements::{InvalidRequirement, Requirement};
+
 /// The letter of a pre-release segment, already normalized to its canonical form.
 ///
 /// PEP 440 spells these many ways (`alpha`, `a`, `beta`, `b`, `c`, `pre`, `preview`,
