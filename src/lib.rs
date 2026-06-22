@@ -16,10 +16,19 @@ pub use specifiers::{InvalidSpecifier, Specifier, SpecifierSet};
 mod tokenizer;
 
 mod markers;
-pub use markers::{InvalidMarker, Marker, MarkerError};
+pub use markers::{EnvValue, EvaluateContext, InvalidMarker, Marker, MarkerError};
 
 mod requirements;
 pub use requirements::{InvalidRequirement, Requirement};
+
+mod tags;
+pub use tags::{InvalidTag, Tag, TagParseError, UnsortedTagsError, parse_tag};
+
+mod utils;
+pub use utils::{
+    BuildTag, InvalidSdistFilename, InvalidWheelFilename, WheelFilename, canonicalize_name,
+    canonicalize_version, is_normalized_name, parse_sdist_filename, parse_wheel_filename,
+};
 
 /// The letter of a pre-release segment, already normalized to its canonical form.
 ///

@@ -4,7 +4,7 @@ A Rust port of Python [`packaging`](https://github.com/pypa/packaging)'s
 [PEP 440](https://peps.python.org/pep-0440/) versions and
 [PEP 508](https://peps.python.org/pep-0508/) dependency specifiers. Version parsing and
 ordering, version specifiers, environment markers, and requirements all mirror the reference
-implementation — verified by differential testing against Python across millions of cases.
+implementation, ported directly from its source.
 
 ## Features
 
@@ -17,6 +17,10 @@ implementation — verified by differential testing against Python across millio
   evaluation against an environment.
 - **Requirements** (`Requirement`) — full dependency specifiers such as
   `requests[security]>=2.0; python_version<"3.9"`.
+- **Utilities** (`utils`): name normalization (`canonicalize_name`, `is_normalized_name`),
+  version canonicalization (`canonicalize_version`), and filename parsing
+  (`parse_wheel_filename`, `parse_sdist_filename`) returning name, `Version`, build tag, and
+  `Tag` set.
 
 ## Installation
 
@@ -80,21 +84,48 @@ let env = HashMap::from([("python_version".to_string(), "3.11".to_string())]);
 assert_eq!(marker.evaluate(&env), Ok(true));
 ```
 
+### Utilities
+
+```rust
+use pyreq::{canonicalize_name, parse_wheel_filename};
+
+assert_eq!(canonicalize_name("Foo.Bar"), "foo-bar");
+
+let (name, version, build, tags) =
+    parse_wheel_filename("requests-2.31.0-py3-none-any.whl", false).unwrap();
+assert_eq!(name, "requests");
+assert_eq!(version.to_string(), "2.31.0");
+assert!(build.is_none());
+assert_eq!(tags.len(), 1);
+```
+
 ## Compatibility
 
-Every layer is differentially tested against the reference Python `packaging` implementation:
-60k+ version strings (validity, normalized output, total ordering), thousands of specifier and
-requirement checks, and marker evaluations — all matching.
+The version, specifier, marker, and requirement layers are ported from `packaging`'s source
+and were cross-checked against it during development. What ships in this repository is the
+in-tree unit test suite (run `cargo test`); a reproducible differential harness is not
+included. The utilities, tag parsing, marker string-escape handling, and set-valued marker
+support are covered by unit tests only.
 
 Notes: version components are stored as 64-bit integers, so values beyond `2^64 − 1` are
 unsupported (they do not occur in practice). `Marker::evaluate` takes an explicit environment
-rather than synthesizing a platform default.
+rather than synthesizing a platform default: a standalone Rust crate is not running inside the
+Python interpreter it describes, so `python_version`, `implementation_name`, and the like have
+no source to read. It does apply the data-only transforms `packaging` does to a supplied
+environment: `extra` is canonicalized (PEP 685) and `python_full_version` is repaired for
+non-tagged builds. `Marker::evaluate` takes string-only values; `Marker::evaluate_with_context`
+takes an environment whose values may be sets (`EnvValue::Str` or `EnvValue::Set`) and an
+`EvaluateContext` (`Metadata`, `LockFile`, `Requirement`) that injects the empty `extra` /
+`extras` / `dependency_groups` defaults, so set-valued markers like `"cpu" in extras` evaluate.
 
 ## Scope
 
-Covers PEP 440 versions and PEP 508 dependency specifiers — versions, specifiers, markers, and
-requirements. Platform/format helpers from `packaging` (wheel tags, metadata, manylinux, etc.)
-are out of scope.
+Covers PEP 440 versions and PEP 508 dependency specifiers (versions, specifiers, markers, and
+requirements), plus the host-independent utilities: name/version normalization, wheel and sdist
+filename parsing, and `Tag`/`parse_tag` for tag strings. Out of scope are the parts of
+`packaging` that introspect the running interpreter or OS and so cannot exist in a standalone
+crate: tag generation (`sys_tags`, `cpython_tags`, manylinux/musllinux/mac platform
+enumeration) and the metadata module.
 
 ## License
 

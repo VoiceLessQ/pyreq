@@ -3,13 +3,14 @@
 //! This step covers parsing a marker string into an AST and rendering it back to canonical
 //! form. Evaluation against an environment is a separate step.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use crate::Specifier;
 use crate::tokenizer::{ParserSyntaxError, Tokenizer, enclosing};
+use crate::utils::canonicalize_name;
 
 /// A marker operand: either an environment variable or a string literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,16 +31,6 @@ pub(crate) enum MarkerExpr {
     List(Vec<MarkerExpr>),
     And,
     Or,
-}
-
-/// PEP 503 name normalization (`canonicalize_name`): lowercase; `_`/`.` become `-`; runs of
-/// `-` collapse. Shared with the requirements layer.
-pub(crate) fn canonicalize_name(name: &str) -> String {
-    let mut value = name.to_lowercase().replace(['_', '.'], "-");
-    while value.contains("--") {
-        value = value.replace("--", "-");
-    }
-    value
 }
 
 // --- Recursive-descent marker parser (port of the marker half of `_parser.py`). ---
@@ -110,7 +101,10 @@ fn parse_marker_var(tok: &mut Tokenizer) -> Result<MarkerVar, ParserSyntaxError>
         Ok(process_env_var(&text))
     } else if tok.check("QUOTED_STRING") {
         let token = tok.read();
-        Ok(process_python_str(&token.text))
+        let span = (token.position, token.position + token.text.len());
+        process_python_str(&token.text).map_err(|_| {
+            tok.syntax_error("Invalid quoted string", Some(span.0), Some(span.1))
+        })
     } else {
         Err(tok.syntax_error("Expected a marker variable or quoted string", None, None))
     }
@@ -124,10 +118,72 @@ fn process_env_var(env_var: &str) -> MarkerVar {
     }
 }
 
-fn process_python_str(quoted: &str) -> MarkerVar {
-    // QUOTED_STRING guarantees matching quotes with no embedded quote, so the content is the
-    // slice between them. (Python's `ast.literal_eval` escape handling is not modelled.)
-    MarkerVar::Value(quoted[1..quoted.len() - 1].to_string())
+/// Port of `_parser.py`'s `process_python_str`, which runs `ast.literal_eval` on the quoted
+/// token. The QUOTED_STRING rule guarantees matching outer quotes with no embedded quote of
+/// the same kind, so only the backslash escapes inside need decoding. Returns `Err` on a
+/// malformed escape (truncated `\x`/`\u`/`\U`, a lone trailing backslash, a surrogate, or
+/// `\N{name}` which would need the Unicode-name database), matching Python raising on
+/// `literal_eval`. Unknown escapes (e.g. `\d`) are kept literally, as CPython does.
+fn process_python_str(quoted: &str) -> Result<MarkerVar, ()> {
+    let inner = &quoted[1..quoted.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next().ok_or(())? {
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '\n' => {} // backslash-newline is a line continuation: drop both
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{0B}'),
+            d @ '0'..='7' => {
+                let mut val = d.to_digit(8).expect("octal digit");
+                for _ in 0..2 {
+                    match chars.peek().and_then(|n| n.to_digit(8)) {
+                        Some(n) => {
+                            val = val * 8 + n;
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                out.push(char::from_u32(val).ok_or(())?);
+            }
+            'x' => out.push(decode_hex(&mut chars, 2)?),
+            'u' => out.push(decode_hex(&mut chars, 4)?),
+            'U' => out.push(decode_hex(&mut chars, 8)?),
+            'N' => return Err(()), // \N{name} needs the Unicode-name database; unsupported
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Ok(MarkerVar::Value(out))
+}
+
+/// Read exactly `n` hex digits and turn them into a `char`. `Err` if fewer than `n` digits
+/// are present or the value is not a valid scalar (e.g. a surrogate).
+fn decode_hex(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    n: usize,
+) -> Result<char, ()> {
+    let mut val: u32 = 0;
+    for _ in 0..n {
+        let d = chars.next().and_then(|c| c.to_digit(16)).ok_or(())?;
+        val = val * 16 + d;
+    }
+    char::from_u32(val).ok_or(())
 }
 
 /// `marker_op = IN | NOT WS IN | OP`
@@ -255,15 +311,101 @@ impl Marker {
         }
     }
 
-    /// Evaluate this marker against `environment` (a complete map of marker variable to
-    /// string value). Port of `markers.py`'s `_evaluate_markers` (the evaluation core).
+    /// Evaluate this marker against `environment` (a map of marker variable to string value).
+    /// Port of `markers.py`'s `Marker.evaluate`, minus default-environment synthesis.
     ///
-    /// Unlike `Marker.evaluate`, this does not synthesize a default environment, canonicalize
-    /// `extra`, or repair `python_full_version` — the caller supplies a prepared environment.
-    /// Set-valued environment entries (`extras`/`dependency_groups`) are not modelled.
+    /// Because pyreq is not running inside the Python interpreter it describes, it cannot
+    /// build a default environment (`python_version`, `implementation_name`, etc. have no
+    /// source). The caller supplies the environment; a marker variable missing from it is an
+    /// `UndefinedEnvironmentName` error rather than a synthesized default.
+    ///
+    /// The faithful, data-only transforms packaging applies are ported: `extra` is
+    /// canonicalized (PEP 685) and `python_full_version` is repaired for non-tagged builds (a
+    /// trailing `+` gets `local` appended, per `_repair_python_full_version`).
+    ///
+    /// This entry takes string-only values, so it cannot express the set-valued `extras` /
+    /// `dependency_groups` variables. Use [`Marker::evaluate_with_context`] for those.
     pub fn evaluate(&self, environment: &HashMap<String, String>) -> Result<bool, MarkerError> {
-        evaluate_markers(&self.markers, environment)
+        let env: HashMap<String, EnvValue> = environment
+            .iter()
+            .map(|(k, v)| (k.clone(), EnvValue::Str(v.clone())))
+            .collect();
+        self.eval_prepared(env)
     }
+
+    /// Evaluate against an environment whose values may be sets, in a given context. Full port
+    /// of `markers.py`'s `Marker.evaluate` evaluation semantics (still minus host default
+    /// synthesis).
+    ///
+    /// `context` injects the defaults packaging adds before the caller's environment overlays
+    /// them: [`EvaluateContext::Metadata`] supplies an empty `extra`; [`EvaluateContext::LockFile`]
+    /// supplies empty `extras` and `dependency_groups` sets (so a marker like `"x" in extras`
+    /// evaluates to `false` rather than erroring when the caller omits them);
+    /// [`EvaluateContext::Requirement`] injects nothing. Host-derived variables are still the
+    /// caller's responsibility.
+    pub fn evaluate_with_context(
+        &self,
+        environment: &HashMap<String, EnvValue>,
+        context: EvaluateContext,
+    ) -> Result<bool, MarkerError> {
+        let mut env: HashMap<String, EnvValue> = HashMap::new();
+        match context {
+            EvaluateContext::LockFile => {
+                env.insert("extras".to_string(), EnvValue::Set(HashSet::new()));
+                env.insert("dependency_groups".to_string(), EnvValue::Set(HashSet::new()));
+            }
+            EvaluateContext::Metadata => {
+                env.insert("extra".to_string(), EnvValue::Str(String::new()));
+            }
+            EvaluateContext::Requirement => {}
+        }
+        for (k, v) in environment {
+            env.insert(k.clone(), v.clone());
+        }
+        self.eval_prepared(env)
+    }
+
+    /// Shared evaluation tail: apply the `extra` canonicalization and `python_full_version`
+    /// repair, then run the core. Used by both public entry points.
+    fn eval_prepared(&self, mut env: HashMap<String, EnvValue>) -> Result<bool, MarkerError> {
+        if let Some(EnvValue::Str(extra)) = env.get("extra").cloned() {
+            let canon = if extra.is_empty() {
+                String::new()
+            } else {
+                canonicalize_name(&extra)
+            };
+            env.insert("extra".to_string(), EnvValue::Str(canon));
+        }
+        if let Some(EnvValue::Str(full)) = env.get("python_full_version").cloned()
+            && let Some(stripped) = full.strip_suffix('+')
+        {
+            env.insert(
+                "python_full_version".to_string(),
+                EnvValue::Str(format!("{stripped}+local")),
+            );
+        }
+        evaluate_markers(&self.markers, &env)
+    }
+}
+
+/// A marker environment value: a single string (most variables) or a set of strings (the
+/// `extras` / `dependency_groups` variables). Mirrors packaging's `str | AbstractSet[str]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvValue {
+    Str(String),
+    Set(HashSet<String>),
+}
+
+/// The context a marker is evaluated in, controlling which empty defaults are injected.
+/// Port of `markers.py`'s `EvaluateContext` literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluateContext {
+    /// Core metadata (packaging's default): an empty `extra` is supplied.
+    Metadata,
+    /// Lock files: empty `extras` and `dependency_groups` sets are supplied.
+    LockFile,
+    /// Any other situation: no defaults are injected.
+    Requirement,
 }
 
 /// An error raised while evaluating a marker. Mirrors `UndefinedComparison` and a missing
@@ -303,7 +445,7 @@ const MARKERS_REQUIRING_VERSION: [&str; 4] = [
 
 fn evaluate_markers(
     markers: &[MarkerExpr],
-    env: &HashMap<String, String>,
+    env: &HashMap<String, EnvValue>,
 ) -> Result<bool, MarkerError> {
     // Groups split on `or`; within a group every item must hold (`and`). Any group holding
     // makes the whole expression true.
@@ -316,25 +458,7 @@ fn evaluate_markers(
                 groups.last_mut().expect("group exists").push(value);
             }
             MarkerExpr::Item { lhs, op, rhs } => {
-                // The variable side picks the environment key; the other side is its operand.
-                let (lhs_value, env_key, rhs_value) = if matches!(lhs, MarkerVar::Variable(_)) {
-                    let key = operand_str(lhs);
-                    let value = env
-                        .get(&key)
-                        .cloned()
-                        .ok_or_else(|| MarkerError::UndefinedEnvironmentName(key.clone()))?;
-                    (value, key, operand_str(rhs))
-                } else {
-                    let key = operand_str(rhs);
-                    let value = env
-                        .get(&key)
-                        .cloned()
-                        .ok_or_else(|| MarkerError::UndefinedEnvironmentName(key.clone()))?;
-                    (operand_str(lhs), key, value)
-                };
-
-                let (lhs_value, rhs_value) = normalize_operands(&lhs_value, &rhs_value, &env_key);
-                let result = eval_op(&lhs_value, op, &rhs_value, &env_key)?;
+                let result = evaluate_item(lhs, op, rhs, env)?;
                 groups.last_mut().expect("group exists").push(result);
             }
             MarkerExpr::Or => groups.push(Vec::new()),
@@ -343,6 +467,86 @@ fn evaluate_markers(
     }
 
     Ok(groups.iter().any(|group| group.iter().all(|&b| b)))
+}
+
+/// Evaluate a single `lhs op rhs` comparison. The variable side picks the environment key; the
+/// other side is its string operand. When the looked-up value is a set, packaging asserts the
+/// left operand is a string (so the set must sit on the right), then does membership.
+fn evaluate_item(
+    lhs: &MarkerVar,
+    op: &str,
+    rhs: &MarkerVar,
+    env: &HashMap<String, EnvValue>,
+) -> Result<bool, MarkerError> {
+    let var_is_lhs = matches!(lhs, MarkerVar::Variable(_));
+    let key = if var_is_lhs {
+        operand_str(lhs)
+    } else {
+        operand_str(rhs)
+    };
+    let value = env
+        .get(&key)
+        .ok_or_else(|| MarkerError::UndefinedEnvironmentName(key.clone()))?;
+    // The operand on the non-variable side is always a plain string.
+    let other = if var_is_lhs {
+        operand_str(rhs)
+    } else {
+        operand_str(lhs)
+    };
+
+    match value {
+        EnvValue::Str(s) => {
+            let (lhs_value, rhs_value) = if var_is_lhs {
+                (s.clone(), other)
+            } else {
+                (other, s.clone())
+            };
+            let (lhs_value, rhs_value) = normalize_operands(&lhs_value, &rhs_value, &key);
+            eval_op(&lhs_value, op, &rhs_value, &key)
+        }
+        EnvValue::Set(set) => {
+            if var_is_lhs {
+                // The set landed on the left; packaging's `assert isinstance(lhs_value, str)`
+                // would fail. A set-valued variable is only usable on the right of `in`/`not in`.
+                return Err(MarkerError::UndefinedComparison(format!(
+                    "{key:?} is set-valued and can only appear on the right of a comparison"
+                )));
+            }
+            eval_set_op(&other, op, set, &key)
+        }
+    }
+}
+
+const MARKERS_ALLOWING_SET: [&str; 2] = ["extras", "dependency_groups"];
+
+/// Evaluate a `string op set` comparison. For the set-allowing keys both sides are
+/// canonicalized (PEP 685). Mirrors packaging's `_operators` applied with a set right operand:
+/// `in`/`not in` test membership; `==`/`<=`/`>=`/`<`/`>` are all false (a string never equals
+/// or orders against a set); `!=` is true.
+fn eval_set_op(
+    lhs: &str,
+    op: &str,
+    set: &HashSet<String>,
+    key: &str,
+) -> Result<bool, MarkerError> {
+    let (needle, members): (String, HashSet<String>) = if MARKERS_ALLOWING_SET.contains(&key) {
+        (
+            canonicalize_name(lhs),
+            set.iter().map(|m| canonicalize_name(m)).collect(),
+        )
+    } else {
+        (lhs.to_string(), set.clone())
+    };
+
+    match op {
+        "in" => Ok(members.contains(&needle)),
+        "not in" => Ok(!members.contains(&needle)),
+        "<" | "<=" | "==" | ">=" | ">" => Ok(false),
+        "!=" => Ok(true),
+        _ => Err(MarkerError::UndefinedComparison(format!(
+            "Undefined {op:?} on {lhs:?} and a set."
+        ))),
+    }
 }
 
 /// Port of `_normalize`: canonicalize both sides for set-style keys; leave others as-is.
@@ -365,16 +569,14 @@ fn eval_op(lhs: &str, op: &str, rhs: &str, key: &str) -> Result<bool, MarkerErro
         return Ok(spec.contains(lhs, Some(true)));
     }
 
+    // Non-version keys use packaging's `_operators` table: `<`/`>` are always false, `<=`/
+    // `==`/`>=` collapse to equality, `!=` is inequality, `in`/`not in` test substring.
     match op {
         "in" => Ok(rhs.contains(lhs)),
         "not in" => Ok(!rhs.contains(lhs)),
-        // Non-version keys use Python's string operators (lexicographic), per `_operators`.
-        "<" => Ok(lhs < rhs),
-        "<=" => Ok(lhs <= rhs),
-        "==" => Ok(lhs == rhs),
+        "<" | ">" => Ok(false),
+        "<=" | "==" | ">=" => Ok(lhs == rhs),
         "!=" => Ok(lhs != rhs),
-        ">=" => Ok(lhs >= rhs),
-        ">" => Ok(lhs > rhs),
         _ => Err(MarkerError::UndefinedComparison(format!(
             "Undefined {op:?} on {lhs:?} and {rhs:?}."
         ))),
@@ -527,12 +729,14 @@ mod tests {
         assert!(m("os_name != \"nt\"").evaluate(&e).unwrap());
         assert!(m("\"x86\" in platform_machine").evaluate(&e).unwrap());
         assert!(m("platform_machine not in \"arm64\"").evaluate(&e).unwrap());
-        // String keys compare lexicographically (Python's str operators), not equality-only.
-        assert!(m("os_name < \"z\"").evaluate(&e).unwrap()); // "posix" < "z"
-        assert!(!m("os_name < \"a\"").evaluate(&e).unwrap());
-        assert!(m("os_name <= \"z\"").evaluate(&e).unwrap()); // <= is a real compare, not ==
-        assert!(m("os_name >= \"posix\"").evaluate(&e).unwrap());
-        assert!(!m("os_name > \"z\"").evaluate(&e).unwrap());
+        // Non-version keys follow packaging's `_operators`: `<`/`>` are always false, and
+        // `<=`/`>=` collapse to equality (not lexicographic ordering).
+        assert!(!m("os_name < \"z\"").evaluate(&e).unwrap());
+        assert!(!m("os_name > \"a\"").evaluate(&e).unwrap());
+        assert!(m("os_name <= \"posix\"").evaluate(&e).unwrap()); // <= means ==
+        assert!(!m("os_name <= \"z\"").evaluate(&e).unwrap());
+        assert!(m("os_name >= \"posix\"").evaluate(&e).unwrap()); // >= means ==
+        assert!(!m("os_name >= \"z\"").evaluate(&e).unwrap());
     }
 
     #[test]
@@ -553,6 +757,143 @@ mod tests {
                 .evaluate(&e)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn string_escapes_are_decoded() {
+        // \x2e is '.', so the literal becomes "3.6"; round-trips through Display too.
+        assert_eq!(
+            m("python_version == \"3\\x2e6\"").to_string(),
+            "python_version == \"3.6\""
+        );
+        // \\ and \n decode to a backslash and a newline.
+        assert_eq!(m("os_name == \"a\\\\b\"").to_string(), "os_name == \"a\\b\"");
+        assert_eq!(
+            m("os_name == \"a\\nb\"").to_string(),
+            "os_name == \"a\nb\""
+        );
+        // Unknown escape \d keeps both characters literally, as CPython does.
+        assert_eq!(
+            m("os_name == \"a\\db\"").to_string(),
+            "os_name == \"a\\db\""
+        );
+    }
+
+    #[test]
+    fn malformed_escapes_are_rejected() {
+        // Truncated \x and an unsupported \N{...} fail to parse.
+        assert!(Marker::parse("os_name == \"a\\x1\"").is_err());
+        assert!(Marker::parse("os_name == \"\\N{BULLET}\"").is_err());
+    }
+
+    #[test]
+    fn evaluate_canonicalizes_extra() {
+        // The marker side is canonicalized at parse time; the env value at eval time.
+        let mut e = HashMap::new();
+        e.insert("extra".to_string(), "Foo.Bar".to_string());
+        assert!(m("extra == \"foo-bar\"").evaluate(&e).unwrap());
+    }
+
+    #[test]
+    fn evaluate_repairs_python_full_version() {
+        // A non-tagged build reports "3.11.0+"; repair appends "local" so it parses as a
+        // PEP 440 version and the comparison succeeds.
+        let mut e = HashMap::new();
+        e.insert("python_full_version".to_string(), "3.11.0+".to_string());
+        assert!(m("python_full_version >= \"3.11.0\"").evaluate(&e).unwrap());
+    }
+
+    #[test]
+    fn lock_file_context_supplies_empty_sets() {
+        let empty = HashMap::new();
+        // With no caller env, the lock-file context still defines extras as an empty set, so
+        // membership is false (rather than UndefinedEnvironmentName).
+        assert!(
+            !m("\"cpu\" in extras")
+                .evaluate_with_context(&empty, EvaluateContext::LockFile)
+                .unwrap()
+        );
+        assert!(
+            m("\"cpu\" not in extras")
+                .evaluate_with_context(&empty, EvaluateContext::LockFile)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn set_membership_and_canonicalization() {
+        let mut e = HashMap::new();
+        e.insert(
+            "extras".to_string(),
+            EnvValue::Set(HashSet::from(["foo-bar".to_string(), "gpu".to_string()])),
+        );
+        assert!(
+            m("\"gpu\" in extras")
+                .evaluate_with_context(&e, EvaluateContext::LockFile)
+                .unwrap()
+        );
+        // PEP 685: the literal is canonicalized before membership, so "Foo.Bar" matches "foo-bar".
+        assert!(
+            m("\"Foo.Bar\" in extras")
+                .evaluate_with_context(&e, EvaluateContext::LockFile)
+                .unwrap()
+        );
+        assert!(
+            !m("\"missing\" in extras")
+                .evaluate_with_context(&e, EvaluateContext::LockFile)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dependency_groups_set() {
+        let mut e = HashMap::new();
+        e.insert(
+            "dependency_groups".to_string(),
+            EnvValue::Set(HashSet::from(["test".to_string()])),
+        );
+        assert!(
+            m("\"test\" in dependency_groups")
+                .evaluate_with_context(&e, EvaluateContext::LockFile)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_context_supplies_empty_extra() {
+        let empty = HashMap::new();
+        assert!(
+            !m("extra == \"foo\"")
+                .evaluate_with_context(&empty, EvaluateContext::Metadata)
+                .unwrap()
+        );
+        let mut e = HashMap::new();
+        e.insert("extra".to_string(), EnvValue::Str("Foo".to_string()));
+        assert!(
+            m("extra == \"foo\"")
+                .evaluate_with_context(&e, EvaluateContext::Metadata)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn set_valued_variable_on_left_errors() {
+        let mut e = HashMap::new();
+        e.insert("extras".to_string(), EnvValue::Set(HashSet::new()));
+        assert!(matches!(
+            m("extras == \"foo\"").evaluate_with_context(&e, EvaluateContext::LockFile),
+            Err(MarkerError::UndefinedComparison(_))
+        ));
+    }
+
+    #[test]
+    fn requirement_context_injects_nothing() {
+        let empty = HashMap::new();
+        // No defaults, so a reference to extras is undefined.
+        assert!(matches!(
+            m("\"x\" in extras").evaluate_with_context(&empty, EvaluateContext::Requirement),
+            Err(MarkerError::UndefinedEnvironmentName(_))
+        ));
     }
 
     #[test]

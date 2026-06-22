@@ -6,8 +6,9 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use crate::SpecifierSet;
-use crate::markers::{Marker, MarkerExpr, canonicalize_name, parse_marker};
+use crate::markers::{Marker, MarkerExpr, parse_marker};
 use crate::tokenizer::{ParserSyntaxError, Tokenizer, enclosing};
+use crate::utils::canonicalize_name;
 
 /// Raised when a requirement string cannot be parsed (PEP 508). Holds the parser error text.
 #[derive(Debug, Clone, PartialEq, Eq)]
