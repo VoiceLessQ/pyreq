@@ -124,5 +124,5 @@ This crate currently covers PEP 440 **version identifiers**. Version specifiers
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[BSD 2-Clause License](LICENSE-BSD) at your option, matching the upstream `packaging` project.
+Licensed under the [BSD 2-Clause License](LICENSE-BSD), one of the licenses the upstream
+`packaging` project offers.

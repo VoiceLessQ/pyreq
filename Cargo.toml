@@ -2,6 +2,12 @@
 name = "packaging"
 version = "0.1.0"
 edition = "2024"
+description = "PEP 440 version identifiers: parsing, comparison, and normalization, compatible with Python's packaging."
+license = "BSD-2-Clause"
+repository = "https://github.com/VoiceLessQ/packaging-rs"
+readme = "README.md"
+keywords = ["pep440", "version", "versioning", "packaging", "python"]
+categories = ["parser-implementations"]
 
 [dependencies]
 regex = "1.12.4"
