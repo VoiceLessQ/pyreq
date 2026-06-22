@@ -174,17 +174,23 @@ impl Specifier {
 
     /// Whether `item` satisfies this specifier.
     ///
-    /// `prereleases`: `Some(true)`/`Some(false)` force the policy; `None` autodetects.
-    /// Port of `specifiers.py`'s `Specifier.contains`. Note: unlike `filter`, a single
-    /// `contains` does *not* apply the "buffer pre-releases until a final" rule — a
-    /// matching pre-release is included unless the policy is explicitly `false`.
+    /// `prereleases`: `Some(true)`/`Some(false)` force the policy; `None` uses this specifier's
+    /// own `prereleases()`, which defaults to excluding pre-releases (only a spec whose own
+    /// version is a pre-release admits them). Port of `specifiers.py`'s `Specifier.contains`.
+    ///
+    /// Divergence: an `===` specifier whose version is not a valid PEP 440 string (e.g.
+    /// `===foobar`) returns `false` here for any item it does not match; packaging instead
+    /// raises (computing `self.prereleases` parses the arbitrary string and fails). A
+    /// `bool`-returning API cannot reproduce that, and returning `false` is the safer behaviour.
     pub fn contains(&self, item: &str, prereleases: Option<bool>) -> bool {
         // `===` matches the raw string case-insensitively; a parse would be wasted.
         if self.operator == "===" {
             if item.to_lowercase() != self.version.to_lowercase() {
                 return false;
             }
-            let effective = prereleases.or_else(|| resolve_prereleases(self.prereleases, self.prereleases()));
+            // packaging's `contains` gates on `self.prereleases` (the property) directly, which
+            // defaults to false; only an explicit `prereleases=` argument overrides it.
+            let effective = prereleases.or_else(|| self.prereleases());
             if effective == Some(false) && coerce_version(item).is_some_and(|v| v.is_prerelease()) {
                 return false;
             }
@@ -196,7 +202,7 @@ impl Specifier {
             None => return false, // standard operators never match an unparsable input
         };
 
-        let effective = prereleases.or_else(|| resolve_prereleases(self.prereleases, self.prereleases()));
+        let effective = prereleases.or_else(|| self.prereleases());
         if effective == Some(false) && parsed.is_prerelease() {
             return false;
         }
@@ -269,32 +275,10 @@ fn public_of(v: &Version) -> Version {
     Version::parse(&v.public()).expect("public() yields a valid version")
 }
 
-/// `V` with `dev` forced to 0 and any local removed (`V.__replace__(dev=0, local=None)`).
-fn with_dev0_no_local(v: &Version) -> Version {
-    let mut parts = v.to_parts();
-    parts.dev = Some(0);
-    parts.local = None;
-    Version::from_parts(parts).expect("a .dev0 version is valid")
-}
-
-/// Whether `p` shares `v`'s "family": same epoch, same trimmed release, and same
-/// pre-release. Used to carve `V` and its post/local variants out of `>V`.
-fn same_family(p: &Version, v: &Version) -> bool {
-    if p.epoch() != v.epoch() {
-        return false;
-    }
-    let trimmed = v.release_trimmed();
-    let release = p.release();
-    if release.len() < trimmed.len() {
-        return false;
-    }
-    if release[..trimmed.len()] != trimmed[..] {
-        return false;
-    }
-    if release[trimmed.len()..].iter().any(|&x| x != 0) {
-        return false;
-    }
-    p.pre() == v.pre()
+/// Whether two versions share a base version (epoch + release, ignoring pre/post/dev/local).
+/// Mirrors packaging's `Version(a.base_version) == Version(b.base_version)`.
+fn base_version_eq(a: &Version, b: &Version) -> bool {
+    parse_spec(&a.base_version()) == parse_spec(&b.base_version())
 }
 
 /// Construct `epoch!release.dev0`, the smallest version with that epoch+release.
@@ -316,7 +300,7 @@ fn operator_match(op: &str, parsed: &Version, version: &str) -> bool {
         "==" => compare_equal(parsed, version),
         "!=" => !compare_equal(parsed, version),
         "<=" => public_of(parsed) <= parse_spec(version),
-        ">=" => *parsed >= parse_spec(version),
+        ">=" => public_of(parsed) >= parse_spec(version),
         "<" => compare_less_than(parsed, version),
         ">" => compare_greater_than(parsed, version),
         other => unreachable!("unexpected operator {other:?}"),
@@ -359,41 +343,34 @@ fn compare_equal(parsed: &Version, version: &str) -> bool {
     }
 }
 
-/// `<V`. The upper bound is `V` itself when `V` is a pre-release, otherwise `V.dev0` — so
-/// `<V` of a final/post release excludes `V` and all of `V`'s own pre/post/local versions.
+/// `<V`. Direct port of packaging's `_compare_less_than`: below `V`, but a pre-release of `V`'s
+/// own base version is excluded unless `V` is itself a pre-release.
 fn compare_less_than(parsed: &Version, version: &str) -> bool {
     let spec = parse_spec(version);
-    let bound = if spec.is_prerelease() {
-        spec
-    } else {
-        with_dev0_no_local(&spec)
-    };
-    *parsed < bound
+    if !(*parsed < spec) {
+        return false;
+    }
+    if !spec.is_prerelease() && parsed.is_prerelease() && base_version_eq(parsed, &spec) {
+        return false;
+    }
+    true
 }
 
-/// `>V`. For a dev/post spec the lower bound is the next dev/post release; otherwise `>V`
-/// excludes `V` and its whole family (same epoch, release, and pre — i.e. `V`, `V+local`,
-/// and every `V.postN`).
+/// `>V`. Direct port of packaging's `_compare_greater_than`: above `V`, but a post-release of
+/// `V`'s base version is excluded unless `V` is itself a post-release, and a local of `V`'s base
+/// version is always excluded.
 fn compare_greater_than(parsed: &Version, version: &str) -> bool {
     let spec = parse_spec(version);
-
-    if let Some(dev) = spec.dev() {
-        // >V.devN: dev releases have no posts, so the next real version is V.dev(N+1).
-        let mut parts = spec.to_parts();
-        parts.dev = Some(dev + 1);
-        parts.local = None;
-        return *parsed >= Version::from_parts(parts).expect("valid lower bound");
+    if !(*parsed > spec) {
+        return false;
     }
-    if let Some(post) = spec.post() {
-        // >V.postN: the next real version is V.post(N+1).dev0.
-        let mut parts = spec.to_parts();
-        parts.post = Some(post + 1);
-        parts.dev = Some(0);
-        parts.local = None;
-        return *parsed >= Version::from_parts(parts).expect("valid lower bound");
+    if !spec.is_postrelease() && parsed.is_postrelease() && base_version_eq(parsed, &spec) {
+        return false;
     }
-
-    *parsed > spec && !same_family(parsed, &spec)
+    if parsed.local().is_some() && base_version_eq(parsed, &spec) {
+        return false;
+    }
+    true
 }
 
 /// Apply the three-way pre-release policy to an already-matched, order-preserving list.
@@ -551,7 +528,9 @@ impl SpecifierSet {
 
         let matches = self.matches_all(item);
 
-        if effective == Some(false) && coerce_version(item).is_some_and(|v| v.is_prerelease()) {
+        // packaging gates with `not prereleases`, so a prerelease is excluded unless the policy
+        // is explicitly true (a `None`/unknown policy still excludes, unlike a single specifier).
+        if effective != Some(true) && coerce_version(item).is_some_and(|v| v.is_prerelease()) {
             return false;
         }
         matches
@@ -686,12 +665,13 @@ mod tests {
     }
 
     #[test]
-    fn greater_equal_includes_prereleases_by_default() {
+    fn greater_equal_excludes_prereleases_by_default() {
         let spec = s(">=1.2.3");
         assert!(spec.contains("1.2.3", None));
         assert!(!spec.contains("1.0.0", None));
-        assert!(spec.contains("1.3.0a1", None)); // matching pre-release allowed by default
-        assert!(!spec.contains("1.3.0a1", Some(false))); // ...but not when forced off
+        // A non-prerelease spec excludes matching pre-releases by default (packaging semantics).
+        assert!(!spec.contains("1.3.0a1", None));
+        assert!(spec.contains("1.3.0a1", Some(true))); // ...unless forced on
     }
 
     #[test]
@@ -771,8 +751,8 @@ mod tests {
         assert!(ss.contains("1.2.3", None));
         assert!(!ss.contains("1.0.1", None)); // excluded by !=
         assert!(!ss.contains("0.9", None)); // below >=
-        assert!(ss.contains("1.3.0a1", None)); // pre-release included by default
-        assert!(!ss.contains("1.3.0a1", Some(false)));
+        assert!(!ss.contains("1.3.0a1", None)); // pre-release excluded by default
+        assert!(ss.contains("1.3.0a1", Some(true)));
     }
 
     #[test]
@@ -788,8 +768,9 @@ mod tests {
         let ss = set("");
         assert!(ss.is_empty());
         assert!(ss.contains("1.0", None));
-        assert!(ss.contains("1.5a1", None)); // a lone pre-release is included
-        assert!(!ss.contains("1.5a1", Some(false)));
+        // An empty set has an unknown (None) prerelease policy, which still excludes prereleases.
+        assert!(!ss.contains("1.5a1", None));
+        assert!(ss.contains("1.5a1", Some(true)));
     }
 
     #[test]

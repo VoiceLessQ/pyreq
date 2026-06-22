@@ -77,7 +77,7 @@ impl fmt::Display for Requirement {
         }
 
         if let Some(url) = &self.url {
-            write!(f, " @ {url}")?;
+            write!(f, "@ {url}")?;
             if self.marker.is_some() {
                 write!(f, " ")?;
             }
@@ -342,11 +342,12 @@ mod tests {
     fn url_form() {
         let req = r("name @ https://example.com/pkg.tar.gz");
         assert_eq!(req.url.as_deref(), Some("https://example.com/pkg.tar.gz"));
-        assert_eq!(req.to_string(), "name @ https://example.com/pkg.tar.gz");
+        // packaging renders the URL form with no space before `@`.
+        assert_eq!(req.to_string(), "name@ https://example.com/pkg.tar.gz");
         let with_marker = r("name @ https://example.com/p.tgz ; python_version > \"3.0\"");
         assert_eq!(
             with_marker.to_string(),
-            "name @ https://example.com/p.tgz ; python_version > \"3.0\""
+            "name@ https://example.com/p.tgz ; python_version > \"3.0\""
         );
     }
 

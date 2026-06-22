@@ -521,8 +521,9 @@ const MARKERS_ALLOWING_SET: [&str; 2] = ["extras", "dependency_groups"];
 
 /// Evaluate a `string op set` comparison. For the set-allowing keys both sides are
 /// canonicalized (PEP 685). Mirrors packaging's `_operators` applied with a set right operand:
-/// `in`/`not in` test membership; `==`/`<=`/`>=`/`<`/`>` are all false (a string never equals
-/// or orders against a set); `!=` is true.
+/// `in`/`not in` test membership; `==` is always false and `!=` always true (a string never
+/// equals a set); the ordering operators error (Python's `operator.lt(str, set)` raises
+/// `TypeError`, surfaced here as `UndefinedComparison`).
 fn eval_set_op(
     lhs: &str,
     op: &str,
@@ -541,8 +542,11 @@ fn eval_set_op(
     match op {
         "in" => Ok(members.contains(&needle)),
         "not in" => Ok(!members.contains(&needle)),
-        "<" | "<=" | "==" | ">=" | ">" => Ok(false),
+        "==" => Ok(false),
         "!=" => Ok(true),
+        "<" | "<=" | ">=" | ">" => Err(MarkerError::UndefinedComparison(format!(
+            "'{op}' not supported between a string and a set ({lhs:?})"
+        ))),
         _ => Err(MarkerError::UndefinedComparison(format!(
             "Undefined {op:?} on {lhs:?} and a set."
         ))),
@@ -561,7 +565,7 @@ fn normalize_operands(lhs: &str, rhs: &str, key: &str) -> (String, String) {
 }
 
 /// Port of `_eval_op`: version-key comparisons go through a `Specifier`; everything else uses
-/// the degenerate PEP 508 string operators (`<`/`>` always false, `<=`/`==`/`>=` are equality).
+/// packaging's `_operators` table, where the ordering operators do real string comparison.
 fn eval_op(lhs: &str, op: &str, rhs: &str, key: &str) -> Result<bool, MarkerError> {
     if MARKERS_REQUIRING_VERSION.contains(&key)
         && let Ok(spec) = Specifier::parse(&format!("{op}{rhs}"))
@@ -569,14 +573,16 @@ fn eval_op(lhs: &str, op: &str, rhs: &str, key: &str) -> Result<bool, MarkerErro
         return Ok(spec.contains(lhs, Some(true)));
     }
 
-    // Non-version keys use packaging's `_operators` table: `<`/`>` are always false, `<=`/
-    // `==`/`>=` collapse to equality, `!=` is inequality, `in`/`not in` test substring.
+    // Non-version keys map to Python's operator functions: lexicographic compare, not equality.
     match op {
         "in" => Ok(rhs.contains(lhs)),
         "not in" => Ok(!rhs.contains(lhs)),
-        "<" | ">" => Ok(false),
-        "<=" | "==" | ">=" => Ok(lhs == rhs),
+        "<" => Ok(lhs < rhs),
+        "<=" => Ok(lhs <= rhs),
+        "==" => Ok(lhs == rhs),
         "!=" => Ok(lhs != rhs),
+        ">=" => Ok(lhs >= rhs),
+        ">" => Ok(lhs > rhs),
         _ => Err(MarkerError::UndefinedComparison(format!(
             "Undefined {op:?} on {lhs:?} and {rhs:?}."
         ))),
@@ -729,13 +735,13 @@ mod tests {
         assert!(m("os_name != \"nt\"").evaluate(&e).unwrap());
         assert!(m("\"x86\" in platform_machine").evaluate(&e).unwrap());
         assert!(m("platform_machine not in \"arm64\"").evaluate(&e).unwrap());
-        // Non-version keys follow packaging's `_operators`: `<`/`>` are always false, and
-        // `<=`/`>=` collapse to equality (not lexicographic ordering).
-        assert!(!m("os_name < \"z\"").evaluate(&e).unwrap());
-        assert!(!m("os_name > \"a\"").evaluate(&e).unwrap());
-        assert!(m("os_name <= \"posix\"").evaluate(&e).unwrap()); // <= means ==
-        assert!(!m("os_name <= \"z\"").evaluate(&e).unwrap());
-        assert!(m("os_name >= \"posix\"").evaluate(&e).unwrap()); // >= means ==
+        // Non-version keys follow packaging's `_operators`: ordering ops compare strings
+        // lexicographically (os_name = "posix").
+        assert!(m("os_name < \"z\"").evaluate(&e).unwrap());
+        assert!(m("os_name > \"a\"").evaluate(&e).unwrap());
+        assert!(m("os_name <= \"posix\"").evaluate(&e).unwrap());
+        assert!(m("os_name <= \"z\"").evaluate(&e).unwrap());
+        assert!(m("os_name >= \"posix\"").evaluate(&e).unwrap());
         assert!(!m("os_name >= \"z\"").evaluate(&e).unwrap());
     }
 
@@ -884,6 +890,29 @@ mod tests {
             m("extras == \"foo\"").evaluate_with_context(&e, EvaluateContext::LockFile),
             Err(MarkerError::UndefinedComparison(_))
         ));
+    }
+
+    #[test]
+    fn set_op_equality_and_ordering() {
+        let mut e = HashMap::new();
+        e.insert(
+            "extras".to_string(),
+            EnvValue::Set(HashSet::from(["gpu".to_string()])),
+        );
+        let ctx = EvaluateContext::LockFile;
+        // A string never equals a set: == is always false, != always true (matches Python).
+        assert!(!m("\"gpu\" == extras").evaluate_with_context(&e, ctx).unwrap());
+        assert!(m("\"gpu\" != extras").evaluate_with_context(&e, ctx).unwrap());
+        // Ordering a string against a set raises in Python (TypeError) -> UndefinedComparison.
+        for op in ["<", "<=", ">=", ">"] {
+            assert!(
+                matches!(
+                    m(&format!("\"gpu\" {op} extras")).evaluate_with_context(&e, ctx),
+                    Err(MarkerError::UndefinedComparison(_))
+                ),
+                "op {op:?} should be an undefined comparison against a set"
+            );
+        }
     }
 
     #[test]

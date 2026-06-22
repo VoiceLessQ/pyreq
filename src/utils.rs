@@ -25,19 +25,28 @@ pub fn canonicalize_name(name: &str) -> String {
     value
 }
 
-/// `_normalized_regex` from `utils.py`: a name already in canonical form.
-static NORMALIZED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?-u)\A[a-z0-9]+(?:-[a-z0-9]+)*\z").expect("normalized regex"));
+/// Shape half of `utils.py`'s `_normalized_regex` (`^([a-z0-9]|[a-z0-9]([a-z0-9-](?!--))*
+/// [a-z0-9])$`): alnum start/end, alnum-or-dash interior. The regex's `(?!--)` lookahead
+/// (no Rust equivalent) is enforced separately in `is_normalized_name`.
+static NORMALIZED_SHAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?-u)\A[a-z0-9]([a-z0-9-]*[a-z0-9])?\z").expect("normalized shape regex")
+});
 
 /// `_wheel_name_regex` from `utils.py`: valid characters for an escaped project name in a
 /// wheel filename. `\w` is Unicode-aware here, matching the source's `re.UNICODE`.
 static WHEEL_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\A[\w._]*\z").expect("wheel name regex"));
 
-/// Whether `name` is already normalized (i.e. `canonicalize_name` round-trips to it).
-/// Port of `utils.is_normalized_name`.
+/// Whether `name` matches `utils.is_normalized_name`. Note this is looser than "equals the
+/// canonical form": the source regex's `(?!--)` permits a doubled dash, but only right after
+/// the single leading character (so `a--b` is "normalized" but `aa--b` and `a---b` are not).
 pub fn is_normalized_name(name: &str) -> bool {
-    NORMALIZED_RE.is_match(name)
+    if !NORMALIZED_SHAPE_RE.is_match(name) {
+        return false;
+    }
+    // `(?!--)` applies after each interior char, so a `--` survives only at index 1.
+    let b = name.as_bytes();
+    !(1..b.len().saturating_sub(1)).any(|i| i != 1 && b[i] == b'-' && b[i + 1] == b'-')
 }
 
 /// Return a canonical form of a version string. By default strips trailing zeros from the
@@ -208,6 +217,13 @@ mod tests {
         assert!(!is_normalized_name("Django"));
         assert!(!is_normalized_name("foo_bar"));
         assert!(!is_normalized_name("foo.bar"));
+        assert!(!is_normalized_name("-ab"));
+        assert!(!is_normalized_name("ab-"));
+        // packaging quirk: a doubled dash is accepted only right after the leading char.
+        assert!(is_normalized_name("a--b"));
+        assert!(!is_normalized_name("aa--b"));
+        assert!(!is_normalized_name("a---b"));
+        assert!(!is_normalized_name("a--b--c"));
     }
 
     #[test]
