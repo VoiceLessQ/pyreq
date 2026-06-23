@@ -403,7 +403,7 @@ fn compare_equal(parsed: &Version, version: &str) -> bool {
 /// own base version is excluded unless `V` is itself a pre-release.
 fn compare_less_than(parsed: &Version, version: &str) -> bool {
     let spec = parse_spec(version);
-    if !(*parsed < spec) {
+    if *parsed >= spec {
         return false;
     }
     if !spec.is_prerelease() && parsed.is_prerelease() && base_version_eq(parsed, &spec) {
@@ -417,7 +417,7 @@ fn compare_less_than(parsed: &Version, version: &str) -> bool {
 /// version is always excluded.
 fn compare_greater_than(parsed: &Version, version: &str) -> bool {
     let spec = parse_spec(version);
-    if !(*parsed > spec) {
+    if *parsed <= spec {
         return false;
     }
     if !spec.is_postrelease() && parsed.is_postrelease() && base_version_eq(parsed, &spec) {

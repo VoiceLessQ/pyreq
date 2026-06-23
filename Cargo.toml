@@ -1,6 +1,6 @@
 [package]
 name = "pyreq"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A Rust port of Python packaging: PEP 440 versions and PEP 508 specifiers, markers, and requirements."
 license = "BSD-2-Clause"
