@@ -1,1 +1,6 @@
 /target
+
+# conformance suite build artifacts
+conformance/harness/target/
+conformance/__pycache__/
+conformance/.hypothesis/
