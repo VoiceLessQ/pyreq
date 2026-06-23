@@ -8,6 +8,7 @@ repository = "https://github.com/VoiceLessQ/pyreq"
 readme = "README.md"
 keywords = ["pep440", "pep508", "version", "packaging", "python"]
 categories = ["parser-implementations"]
+exclude = ["conformance"]
 
 [dependencies]
 regex = "1.12.4"

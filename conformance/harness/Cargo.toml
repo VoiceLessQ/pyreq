@@ -1,0 +1,12 @@
+[package]
+name = "pyreq-conformance-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pyreq = { path = "../.." }
+
+[[bin]]
+name = "pyreq-conformance"
+path = "src/main.rs"

@@ -102,10 +102,22 @@ assert_eq!(tags.len(), 1);
 ## Compatibility
 
 The version, specifier, marker, and requirement layers are ported from `packaging`'s source
-and were cross-checked against it during development. What ships in this repository is the
-in-tree unit test suite (run `cargo test`); a reproducible differential harness is not
-included. The utilities, tag parsing, marker string-escape handling, and set-valued marker
-support are covered by unit tests only.
+and verified against it. Two test layers ship in this repository:
+
+- **Unit tests** (`cargo test`): 87 tests across versions, specifiers, markers, requirements,
+  utilities, and tag parsing.
+- **Differential conformance suite** (`conformance/`): compares `pyreq` against `packaging`
+  25.0 input by input. It runs three ways, all reproducible:
+  - a deterministic generated matrix (~348k version/specifier/marker/requirement/filename cases),
+  - `packaging`'s own test vectors, harvested from its sdist (~70k cases),
+  - a property-based fuzz where `hypothesis` generates PEP 440 / PEP 508 inputs.
+
+  The latest run was clean: zero value divergences across roughly 800k generated cases plus
+  360k hypothesis-generated cases. The one intentional difference is that
+  `Specifier("===<non-PEP-440-string>").contains(...)` raises in `packaging` but returns
+  `false` here, because `contains` returns `bool` and cannot raise. See
+  [`conformance/README.md`](conformance/README.md) to build the harness and reproduce or
+  compare against your own `packaging` version.
 
 Notes: version components are stored as 64-bit integers, so values beyond `2^64 − 1` are
 unsupported (they do not occur in practice). `Marker::evaluate` takes an explicit environment
