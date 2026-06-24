@@ -8,16 +8,16 @@ implementation, ported directly from its source.
 
 ## Features
 
-- **Versions** (`Version`) — PEP 440 parsing with full normalization, total ordering
+- **Versions** (`Version`): PEP 440 parsing with full normalization, total ordering
   (`1.0.dev1 < 1.0a1 < 1.0rc1 < 1.0 < 1.0.post1`), equality/hashing that ignore insignificant
   differences (`1.0 == 1.0.0`), canonical `Display`, component accessors, and `from_parts`.
-- **Specifiers** (`Specifier`, `SpecifierSet`) — `~= == != <= >= < > ===`, wildcards
+- **Specifiers** (`Specifier`, `SpecifierSet`): `~= == != <= >= < > ===`, wildcards
   (`==1.0.*`), comma-joined sets, `contains`, `filter`, and the PEP 440 pre-release rules.
-- **Markers** (`Marker`) — PEP 508 environment markers: parse, canonical `Display`, and
+- **Markers** (`Marker`): PEP 508 environment markers: parse, canonical `Display`, and
   evaluation against an environment.
-- **Requirements** (`Requirement`) — full dependency specifiers such as
+- **Requirements** (`Requirement`): full dependency specifiers such as
   `requests[security]>=2.0; python_version<"3.9"`.
-- **Utilities** (`utils`): name normalization (`canonicalize_name`, `is_normalized_name`),
+- `utils`: name normalization (`canonicalize_name`, `is_normalized_name`),
   version canonicalization (`canonicalize_version`), and filename parsing
   (`parse_wheel_filename`, `parse_sdist_filename`) returning name, `Version`, build tag, and
   `Tag` set.
@@ -104,10 +104,10 @@ assert_eq!(tags.len(), 1);
 The version, specifier, marker, and requirement layers are ported from `packaging`'s source
 and verified against it. Two test layers ship in this repository:
 
-- **Unit tests** (`cargo test`): 87 tests across versions, specifiers, markers, requirements,
+- `cargo test`: 87 unit tests across versions, specifiers, markers, requirements,
   utilities, and tag parsing.
-- **Differential conformance suite** (`conformance/`): compares `pyreq` against `packaging`
-  25.0 input by input. It runs three ways, all reproducible:
+- `conformance/`: differential conformance suite that compares `pyreq` against `packaging`
+  25.0 input by input. Runs three ways, all reproducible:
   - a deterministic generated matrix (~348k version/specifier/marker/requirement/filename cases),
   - `packaging`'s own test vectors, harvested from its sdist (~70k cases),
   - a property-based fuzz where `hypothesis` generates PEP 440 / PEP 508 inputs.
